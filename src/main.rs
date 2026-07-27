@@ -108,6 +108,31 @@ struct AppUi {
     pending_session_save: Cell<Option<glib::SourceId>>,
 }
 
+// The system's own VTE shell integration (/etc/profile.d/vte-2.91.sh,
+// sourced via /etc/bash.bashrc) is what normally reports each tab's
+// directory via OSC 7, which cwd tracking (session persistence) depends
+// on. That chain is easy to have broken outside of term-flashy's control:
+// a customized ~/.bashrc that doesn't source /etc/bash.bashrc, or an older
+// libvte-2.91-common package without the hook at all. To not depend on
+// that, inject a minimal OSC 7 emitter directly into the spawned shell's
+// environment; it only takes effect if nothing later in the shell's own
+// startup unconditionally overwrites PROMPT_COMMAND (same inherent
+// limitation the system's own script has). Bash only for now — zsh's
+// equivalent (precmd_functions) is a shell array, not something settable
+// through the environment.
+const BASH_OSC7_HOOK: &str = r#"printf '\033]7;file://%s%s\033\\' "$HOSTNAME" "$PWD""#;
+
+fn shell_env(shell: &str) -> Vec<String> {
+    let is_bash = std::path::Path::new(shell)
+        .file_name()
+        .is_some_and(|name| name == "bash");
+    if is_bash {
+        vec![format!("PROMPT_COMMAND={BASH_OSC7_HOOK}")]
+    } else {
+        Vec::new()
+    }
+}
+
 fn apply_background_image(picture: &Picture, config: &Config) {
     match &config.background_image {
         Some(path) => {
@@ -144,11 +169,13 @@ impl AppUi {
         let restore_dir = restore.as_ref().and_then(|r| r.cwd.as_deref());
         let restore_title = restore.as_ref().map(|r| r.title.clone());
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let envv = shell_env(&shell);
+        let envv_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             restore_dir,
             &[&shell],
-            &[],
+            &envv_refs,
             glib::SpawnFlags::DEFAULT,
             || {},
             -1,

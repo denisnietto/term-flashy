@@ -11,7 +11,8 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 
 install -m 755 target/release/term-flashy "$HOME/.local/bin/term-flashy"
 install -m 755 target/release/term-flashy-notify "$HOME/.local/bin/term-flashy-notify"
-install -m 644 term-flashy.desktop "$HOME/.local/share/applications/term-flashy.desktop"
+sed "s#@BINDIR@#$HOME/.local/bin#g" term-flashy.desktop \
+  > "$HOME/.local/share/applications/term-flashy.desktop"
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 

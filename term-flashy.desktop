@@ -2,8 +2,8 @@
 Type=Application
 Name=term-flashy
 Comment=Terminal emulator with tabs and per-tab notifications
-Exec=term-flashy
+Exec=@BINDIR@/term-flashy
 Icon=utilities-terminal
 Terminal=false
-Categories=Utility;TerminalEmulator;System;
+Categories=System;TerminalEmulator;
 StartupWMClass=dev.term-flashy

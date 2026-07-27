@@ -2,7 +2,7 @@
 Type=Application
 Name=term-flashy
 Comment=Terminal emulator with tabs and per-tab notifications
-Exec=@BINDIR@/term-flashy
+Exec=env LD_LIBRARY_PATH=@LIBDIR@ @BINDIR@/term-flashy
 Icon=utilities-terminal
 Terminal=false
 Categories=System;TerminalEmulator;

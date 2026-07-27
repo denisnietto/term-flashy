@@ -106,6 +106,8 @@ struct AppUi {
     active_rename: RefCell<Option<(Entry, Box<dyn Fn(bool)>)>>,
     config: RefCell<Config>,
     pending_session_save: Cell<Option<glib::SourceId>>,
+    wallpaper_queue: RefCell<Vec<std::path::PathBuf>>,
+    wallpaper_timer: Cell<Option<glib::SourceId>>,
 }
 
 // The system's own VTE shell integration (/etc/profile.d/vte-2.91.sh,
@@ -133,19 +135,79 @@ fn shell_env(shell: &str) -> Vec<String> {
     }
 }
 
-fn apply_background_image(picture: &Picture, config: &Config) {
-    match &config.background_image {
-        Some(path) => {
-            picture.set_filename(Some(path));
-            picture.set_visible(true);
-        }
-        None => {
-            picture.set_visible(false);
-        }
-    }
+fn scan_wallpaper_folder(folder: &str) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png")
+                })
+        })
+        .collect()
 }
 
 impl AppUi {
+    /// Picks the next background image: refills and shuffles the queue
+    /// (a fresh lap through every image in `background_folder`, so none
+    /// repeats until all have shown once) when it runs out.
+    fn advance_wallpaper(self: &Rc<Self>) {
+        use rand::seq::SliceRandom;
+        if self.wallpaper_queue.borrow().is_empty() {
+            let Some(folder) = self.config.borrow().background_folder.clone() else {
+                self.background_picture.set_visible(false);
+                return;
+            };
+            let mut images = scan_wallpaper_folder(&folder);
+            images.shuffle(&mut rand::rng());
+            *self.wallpaper_queue.borrow_mut() = images;
+        }
+        let Some(path) = self.wallpaper_queue.borrow_mut().pop() else {
+            self.background_picture.set_visible(false);
+            return;
+        };
+        self.background_picture.set_filename(Some(&path));
+        self.background_picture.set_visible(true);
+    }
+
+    /// (Re)starts background handling from the current config: random
+    /// rotation through `background_folder` if set, else the static
+    /// `background_image`, else no background. Called at startup and
+    /// whenever Settings are saved, so changes apply immediately.
+    fn restart_wallpaper_rotation(self: &Rc<Self>) {
+        if let Some(source) = self.wallpaper_timer.take() {
+            source.remove();
+        }
+        self.wallpaper_queue.borrow_mut().clear();
+
+        let config = self.config.borrow();
+        if config.background_folder.is_some() {
+            let interval = config.background_rotate_interval();
+            drop(config);
+            self.advance_wallpaper();
+            let ui = Rc::clone(self);
+            let source = glib::timeout_add_local(interval, move || {
+                ui.advance_wallpaper();
+                glib::ControlFlow::Continue
+            });
+            self.wallpaper_timer.set(Some(source));
+        } else {
+            match &config.background_image {
+                Some(path) => {
+                    self.background_picture.set_filename(Some(path));
+                    self.background_picture.set_visible(true);
+                }
+                None => {
+                    self.background_picture.set_visible(false);
+                }
+            }
+        }
+    }
+
     fn add_tab(self: &Rc<Self>, restore: Option<session::TabState>) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
@@ -425,9 +487,8 @@ impl AppUi {
     }
 
     fn apply_background_settings(self: &Rc<Self>) {
-        let config = self.config.borrow();
-        apply_background_image(&self.background_picture, &config);
-        let alpha = config.terminal_background_alpha();
+        self.restart_wallpaper_rotation();
+        let alpha = self.config.borrow().terminal_background_alpha();
         for entry in self.tabs.borrow().values() {
             entry
                 .terminal
@@ -527,6 +588,45 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     bg_image_row.append(&bg_image_entry);
     root.append(&bg_image_row);
 
+    let bg_folder_label = Label::new(Some("Background folder (random rotation)"));
+    bg_folder_label.set_xalign(0.0);
+    root.append(&bg_folder_label);
+    let bg_folder_row = GtkBox::new(Orientation::Horizontal, 8);
+    let bg_folder_entry = Entry::new();
+    bg_folder_entry.set_hexpand(true);
+    bg_folder_entry.set_width_chars(10);
+    bg_folder_entry.set_placeholder_text(Some("(none)"));
+    bg_folder_entry.set_text(current.background_folder.as_deref().unwrap_or(""));
+    bg_folder_row.append(&bg_folder_entry);
+    let bg_folder_browse = Button::with_label("Browse…");
+    let bg_folder_entry_for_browse = bg_folder_entry.clone();
+    let window_for_browse = window.clone();
+    bg_folder_browse.connect_clicked(move |_| {
+        let dialog = gtk4::FileDialog::new();
+        let entry = bg_folder_entry_for_browse.clone();
+        dialog.select_folder(
+            Some(&window_for_browse),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Ok(folder) = result {
+                    if let Some(path) = folder.path() {
+                        entry.set_text(&path.to_string_lossy());
+                    }
+                }
+            },
+        );
+    });
+    bg_folder_row.append(&bg_folder_browse);
+    root.append(&bg_folder_row);
+
+    let bg_rotate_row = GtkBox::new(Orientation::Horizontal, 8);
+    bg_rotate_row.append(&Label::new(Some("Rotate every (seconds)")));
+    let bg_rotate_spin = gtk4::SpinButton::with_range(1.0, 86400.0, 1.0);
+    bg_rotate_spin.set_value(current.background_rotate_interval_secs as f64);
+    bg_rotate_spin.set_hexpand(true);
+    bg_rotate_row.append(&bg_rotate_spin);
+    root.append(&bg_rotate_row);
+
     let bg_dim_row = GtkBox::new(Orientation::Horizontal, 8);
     bg_dim_row.append(&Label::new(Some("Background dim (%)")));
     let bg_dim_spin = gtk4::SpinButton::with_range(0.0, 100.0, 5.0);
@@ -562,6 +662,7 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     save_button.connect_clicked(move |_| {
         let family = font_family_entry.text();
         let bg_image = bg_image_entry.text();
+        let bg_folder = bg_folder_entry.text();
         let new_config = Config {
             font_family: (!family.trim().is_empty()).then(|| family.trim().to_string()),
             font_size: font_size_spin.value(),
@@ -570,6 +671,9 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
             trigger_long_command: long_command_check.is_active(),
             long_command_threshold_secs: threshold_spin.value() as u64,
             background_image: (!bg_image.trim().is_empty()).then(|| bg_image.trim().to_string()),
+            background_folder: (!bg_folder.trim().is_empty())
+                .then(|| bg_folder.trim().to_string()),
+            background_rotate_interval_secs: bg_rotate_spin.value() as u64,
             background_dim: bg_dim_spin.value() / 100.0,
             restore_session: restore_session_check.is_active(),
         };
@@ -660,8 +764,10 @@ fn build_ui(app: &Application) {
         active_rename: RefCell::new(None),
         config: RefCell::new(config::load()),
         pending_session_save: Cell::new(None),
+        wallpaper_queue: RefCell::new(Vec::new()),
+        wallpaper_timer: Cell::new(None),
     });
-    apply_background_image(&ui.background_picture, &ui.config.borrow());
+    ui.restart_wallpaper_rotation();
 
     // Flush the session synchronously on a clean shutdown: a pending
     // debounced timeout from schedule_session_save() won't get a chance to

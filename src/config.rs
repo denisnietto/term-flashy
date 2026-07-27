@@ -14,8 +14,16 @@ pub struct Config {
     pub background_image: Option<String>,
     /// How much the terminal's own background color covers the image,
     /// from 0.0 (image fully visible, may hurt text readability) to
-    /// 1.0 (image fully hidden). Ignored when `background_image` is unset.
+    /// 1.0 (image fully hidden). Ignored when there's no background image
+    /// (neither `background_image` nor `background_folder` set).
     pub background_dim: f64,
+    /// Folder of images to rotate through as the background, picked in
+    /// random order without repeats until every image has shown once.
+    /// Takes priority over `background_image` when set.
+    pub background_folder: Option<String>,
+    /// How often (in seconds) to switch to the next image when
+    /// `background_folder` is set.
+    pub background_rotate_interval_secs: u64,
     /// Restore open tabs and each tab's working directory on startup,
     /// continuously saved as they change (not just on clean quit).
     pub restore_session: bool,
@@ -32,6 +40,8 @@ impl Default for Config {
             long_command_threshold_secs: 10,
             background_image: None,
             background_dim: 0.55,
+            background_folder: None,
+            background_rotate_interval_secs: 300,
             restore_session: true,
         }
     }
@@ -50,11 +60,15 @@ impl Config {
     /// Alpha to use for the terminal's own background color: opaque
     /// (1.0) when there's no background image, otherwise `background_dim`.
     pub fn terminal_background_alpha(&self) -> f32 {
-        if self.background_image.is_some() {
+        if self.background_folder.is_some() || self.background_image.is_some() {
             self.background_dim as f32
         } else {
             1.0
         }
+    }
+
+    pub fn background_rotate_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.background_rotate_interval_secs)
     }
 }
 

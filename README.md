@@ -84,6 +84,20 @@ Or run the built binary directly: `target/release/term-flashy`.
 
 See `term-flashy --help` for a summary of the app's features.
 
+## Installing (app launcher / sidebar, with icon)
+
+```
+./install.sh
+```
+
+Builds the release binaries and installs them for the current user:
+`term-flashy` and `term-flashy-notify` into `~/.local/bin`, and
+`term-flashy.desktop` into `~/.local/share/applications` so the app
+shows up in the GNOME/Ubuntu launcher and dock/sidebar with an icon.
+Uses the generic system "utilities-terminal" icon for now — drop a
+custom icon file in later and update `Icon=` in `term-flashy.desktop`
+if wanted. Make sure `~/.local/bin` is in your `PATH`.
+
 ## Configuring the app-driven trigger for Claude Code
 
 Add to `~/.claude/settings.json`:

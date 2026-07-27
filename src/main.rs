@@ -509,6 +509,7 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("term-flashy")
+        .icon_name("utilities-terminal")
         .default_width(1000)
         .default_height(650)
         .child(&main_paned)

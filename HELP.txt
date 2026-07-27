@@ -46,6 +46,32 @@ Configurable
   built-in trigger can be turned on or off individually. Settings
   changes apply immediately to already-open tabs, no restart needed.
 
+BUILD NOTE — VTE version
+
+  This project needs libvte-2.91-gtk4 >= 0.78 (for the shell-integration
+  termprops that power the exit-code/long-command triggers). Ubuntu
+  24.04's repo only ships 0.76, so `cargo build` fails at vte4-sys with
+  a "required version >= 0.78" error.
+
+  Fix: build VTE 0.78.7 from source into a user prefix, without
+  touching the system's 0.76:
+
+    sudo apt install -y meson ninja-build gperf liblz4-dev \
+      libsystemd-dev gettext
+    meson setup _build --prefix=$HOME/.local --libdir=lib \
+      --buildtype=release -Dgtk3=false -Dgtk4=true -Ddocs=false \
+      -Dgir=false -Dvapi=false -Dglade=false
+    ninja -C _build && meson install -C _build
+
+  Then add to ~/.bashrc (needed at both build and run time, since the
+  system 0.76 and the new 0.78 share the same .so name — the loader
+  would otherwise pick the wrong one):
+
+    export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+    export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+
+  Once the distro ships VTE >= 0.78, this workaround can be dropped.
+
 USAGE
 
   term-flashy            Start the app

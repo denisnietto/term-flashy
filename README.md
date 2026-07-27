@@ -56,6 +56,12 @@ System dependencies (Debian/Ubuntu package names):
 sudo apt install libgtk-4-dev libvte-2.91-gtk4-dev
 ```
 
+Note: this needs `libvte-2.91-gtk4 >= 0.78`. If your distro's package
+is older (e.g. Ubuntu 24.04 ships 0.76), the build fails at `vte4-sys`
+— see the BUILD NOTE section of `term-flashy --help` (or `HELP.txt`)
+for how to build VTE 0.78 into a user prefix without touching the
+system package.
+
 Then:
 
 ```

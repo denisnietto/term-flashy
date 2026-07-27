@@ -16,6 +16,9 @@ pub struct Config {
     /// from 0.0 (image fully visible, may hurt text readability) to
     /// 1.0 (image fully hidden). Ignored when `background_image` is unset.
     pub background_dim: f64,
+    /// Restore open tabs and each tab's working directory on startup,
+    /// continuously saved as they change (not just on clean quit).
+    pub restore_session: bool,
 }
 
 impl Default for Config {
@@ -29,6 +32,7 @@ impl Default for Config {
             long_command_threshold_secs: 10,
             background_image: None,
             background_dim: 0.55,
+            restore_session: true,
         }
     }
 }

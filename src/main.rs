@@ -1,4 +1,5 @@
 mod config;
+mod session;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -47,6 +48,23 @@ const SIDEBAR_CSS: &str = "
 }
 ";
 
+// vte4 0.10's typed termprop getters (termprop_string, termprop_uint, ...)
+// assert on the GVariant type of the underlying property; "vte.cwd" is
+// URI-typed, and the crate doesn't bind vte_terminal_ref_termprop_uri (its
+// auto-generated wrapper is commented out, unimplemented). The pre-0.78
+// current-directory-uri property/signal are deprecated but still backed by
+// the same value on this VTE version, so use those instead of crashing into
+// a type-assertion CRITICAL.
+#[allow(deprecated)]
+fn connect_cwd_changed(terminal: &vte4::Terminal, f: impl Fn() + 'static) {
+    terminal.connect_current_directory_uri_changed(move |_| f());
+}
+
+#[allow(deprecated)]
+fn terminal_cwd_uri(terminal: &vte4::Terminal) -> Option<glib::GString> {
+    terminal.current_directory_uri()
+}
+
 fn mark_tab_notify(stack: &Stack, page_name: &str, row: &gtk4::ListBoxRow) {
     if stack.visible_child_name().as_deref() != Some(page_name) {
         row.add_css_class("notify");
@@ -75,6 +93,7 @@ fn save_sidebar_width(width: i32) {
 struct TabEntry {
     terminal: vte4::Terminal,
     row: gtk4::ListBoxRow,
+    label: Label,
 }
 
 struct AppUi {
@@ -86,6 +105,7 @@ struct AppUi {
     next_id: Cell<u32>,
     active_rename: RefCell<Option<(Entry, Box<dyn Fn(bool)>)>>,
     config: RefCell<Config>,
+    pending_session_save: Cell<Option<glib::SourceId>>,
 }
 
 fn apply_background_image(picture: &Picture, config: &Config) {
@@ -101,7 +121,7 @@ fn apply_background_image(picture: &Picture, config: &Config) {
 }
 
 impl AppUi {
-    fn add_tab(self: &Rc<Self>) {
+    fn add_tab(self: &Rc<Self>, restore: Option<session::TabState>) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let page_name = format!("tab-{id}");
@@ -121,10 +141,12 @@ impl AppUi {
             )),
             &[],
         );
+        let restore_dir = restore.as_ref().and_then(|r| r.cwd.as_deref());
+        let restore_title = restore.as_ref().map(|r| r.title.clone());
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         terminal.spawn_async(
             PtyFlags::DEFAULT,
-            None,
+            restore_dir,
             &[&shell],
             &[],
             glib::SpawnFlags::DEFAULT,
@@ -157,7 +179,9 @@ impl AppUi {
 
         self.stack.add_named(&terminal, Some(&page_name));
 
-        let label = Label::new(Some(&format!("Tab {}", id + 1)));
+        let label = Label::new(Some(
+            &restore_title.unwrap_or_else(|| format!("Tab {}", id + 1)),
+        ));
         label.set_hexpand(true);
         label.set_xalign(0.0);
 
@@ -177,6 +201,7 @@ impl AppUi {
                     let text = entry_for_finish.text();
                     if !text.trim().is_empty() {
                         label_for_finish.set_text(text.trim());
+                        ui_for_finish.schedule_session_save();
                     }
                 }
                 entry_for_finish.set_visible(false);
@@ -296,9 +321,80 @@ impl AppUi {
             }
         });
 
+        // OSC 7 (same shell integration as the OSC 133 termprops above)
+        // keeps the tab's current directory up to date.
+        let ui_for_cwd = Rc::clone(self);
+        connect_cwd_changed(&terminal, move || {
+            ui_for_cwd.schedule_session_save();
+        });
+
         self.stack.set_visible_child_name(&page_name);
         terminal.grab_focus();
-        self.tabs.borrow_mut().insert(id, TabEntry { terminal, row });
+        self.tabs.borrow_mut().insert(
+            id,
+            TabEntry {
+                terminal,
+                row,
+                label,
+            },
+        );
+        self.schedule_session_save();
+    }
+
+    /// Debounces session writes: `current-directory-uri-changed` can fire in
+    /// quick bursts (e.g. a script `cd`-ing repeatedly), so this coalesces
+    /// them into a single write ~500ms after the last change, instead of
+    /// hitting the disk on every event.
+    fn schedule_session_save(self: &Rc<Self>) {
+        if !self.config.borrow().restore_session {
+            return;
+        }
+        if let Some(source) = self.pending_session_save.take() {
+            source.remove();
+        }
+        let ui = Rc::clone(self);
+        let source = glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            ui.save_session_now();
+            ui.pending_session_save.set(None);
+            glib::ControlFlow::Break
+        });
+        self.pending_session_save.set(Some(source));
+    }
+
+    fn save_session_now(&self) {
+        if !self.config.borrow().restore_session {
+            return;
+        }
+        let tabs = self.tabs.borrow();
+        let mut saved_tabs = Vec::new();
+        let mut index = 0;
+        while let Some(current_row) = self.list_box.row_at_index(index) {
+            let id: Option<u32> = current_row
+                .widget_name()
+                .strip_prefix("tab-")
+                .and_then(|s| s.parse().ok());
+            if let Some(entry) = id.and_then(|id| tabs.get(&id)) {
+                let cwd = terminal_cwd_uri(&entry.terminal)
+                    .and_then(|uri| glib::filename_from_uri(&uri).ok())
+                    .map(|(path, _hostname)| path)
+                    .filter(|path| path.is_dir())
+                    .map(|path| path.to_string_lossy().into_owned());
+                saved_tabs.push(session::TabState {
+                    title: entry.label.text().to_string(),
+                    cwd,
+                });
+            }
+            index += 1;
+        }
+        let active = self
+            .list_box
+            .selected_row()
+            .map(|row| row.index().max(0) as usize)
+            .unwrap_or(0);
+        session::save(&session::SessionState {
+            active,
+            tabs: saved_tabs,
+        });
     }
 
     fn apply_background_settings(self: &Rc<Self>) {
@@ -331,6 +427,7 @@ impl AppUi {
             self.stack.remove(&entry.terminal);
             self.list_box.remove(&entry.row);
         }
+        self.schedule_session_save();
         if self.tabs.borrow().is_empty() {
             self.app.quit();
         } else if self.list_box.selected_row().is_none() {
@@ -411,6 +508,11 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     bg_dim_row.append(&bg_dim_spin);
     root.append(&bg_dim_row);
 
+    let restore_session_check =
+        gtk4::CheckButton::with_label("Restore open tabs and directories on startup");
+    restore_session_check.set_active(current.restore_session);
+    root.append(&restore_session_check);
+
     drop(current);
 
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -442,6 +544,7 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
             long_command_threshold_secs: threshold_spin.value() as u64,
             background_image: (!bg_image.trim().is_empty()).then(|| bg_image.trim().to_string()),
             background_dim: bg_dim_spin.value() / 100.0,
+            restore_session: restore_session_check.is_active(),
         };
         config::save(&new_config);
         *ui_for_save.config.borrow_mut() = new_config;
@@ -529,8 +632,22 @@ fn build_ui(app: &Application) {
         next_id: Cell::new(0),
         active_rename: RefCell::new(None),
         config: RefCell::new(config::load()),
+        pending_session_save: Cell::new(None),
     });
     apply_background_image(&ui.background_picture, &ui.config.borrow());
+
+    // Flush the session synchronously on a clean shutdown: a pending
+    // debounced timeout from schedule_session_save() won't get a chance to
+    // fire after quit(). A crash (kill -9, no shutdown signal) instead
+    // relies on the debounced writes already on disk from the last ~500ms
+    // of activity.
+    let ui_for_session_shutdown = Rc::clone(&ui);
+    app.connect_shutdown(move |_app| {
+        if let Some(source) = ui_for_session_shutdown.pending_session_save.take() {
+            source.remove();
+        }
+        ui_for_session_shutdown.save_session_now();
+    });
 
     let ui_for_selection = Rc::clone(&ui);
     list_box.connect_row_selected(move |_, row| {
@@ -545,12 +662,13 @@ fn build_ui(app: &Application) {
                     child.grab_focus();
                 }
             });
+            ui_for_selection.schedule_session_save();
         }
     });
 
     let ui_for_add = Rc::clone(&ui);
     add_button.connect_clicked(move |_| {
-        ui_for_add.add_tab();
+        ui_for_add.add_tab(None);
     });
 
     let ui_for_settings = Rc::clone(&ui);
@@ -599,7 +717,7 @@ fn build_ui(app: &Application) {
         if state.contains(ctrl_shift) {
             match keyval {
                 gdk::Key::T | gdk::Key::t => {
-                    ui_for_shortcut.add_tab();
+                    ui_for_shortcut.add_tab(None);
                     return glib::Propagation::Stop;
                 }
                 gdk::Key::Up => {
@@ -617,7 +735,23 @@ fn build_ui(app: &Application) {
     });
     window.add_controller(window_key_controller);
 
-    ui.add_tab();
+    let saved_session = if ui.config.borrow().restore_session {
+        session::load()
+    } else {
+        session::SessionState::default()
+    };
+    if saved_session.tabs.is_empty() {
+        ui.add_tab(None);
+    } else {
+        for tab in saved_session.tabs {
+            ui.add_tab(Some(tab));
+        }
+        let active_row = ui
+            .list_box
+            .row_at_index(saved_session.active as i32)
+            .or_else(|| ui.list_box.row_at_index(0));
+        ui.list_box.select_row(active_row.as_ref());
+    }
 
     window.present();
 }

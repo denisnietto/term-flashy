@@ -360,6 +360,54 @@ impl AppUi {
         self.list_box.append(&row);
         self.list_box.select_row(Some(&row));
 
+        // Drag-and-drop tab reordering: each row can be picked up (carrying
+        // its tab id as the drag payload) and dropped onto another row to
+        // swap places with it.
+        let drag_source = gtk4::DragSource::new();
+        drag_source.set_actions(gdk::DragAction::MOVE);
+        drag_source.connect_prepare(move |_source, _x, _y| {
+            Some(gdk::ContentProvider::for_value(&id.to_value()))
+        });
+        let row_for_icon = row.clone();
+        drag_source.connect_drag_begin(move |source, _drag| {
+            let paintable = gtk4::WidgetPaintable::new(Some(&row_for_icon));
+            source.set_icon(Some(&paintable), 0, 0);
+        });
+        row.add_controller(drag_source);
+
+        let drop_target = gtk4::DropTarget::new(glib::types::Type::U32, gdk::DragAction::MOVE);
+        let ui_for_drop = Rc::clone(self);
+        let row_for_drop = row.clone();
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Ok(source_id) = value.get::<u32>() else {
+                return false;
+            };
+            let Some(source_row) = ui_for_drop
+                .tabs
+                .borrow()
+                .get(&source_id)
+                .map(|entry| entry.row.clone())
+            else {
+                return false;
+            };
+            if source_row == row_for_drop {
+                return false;
+            }
+            let target_index = row_for_drop.index();
+            let source_index = source_row.index();
+            ui_for_drop.list_box.remove(&source_row);
+            let new_index = if source_index < target_index {
+                target_index - 1
+            } else {
+                target_index
+            };
+            ui_for_drop.list_box.insert(&source_row, new_index);
+            ui_for_drop.list_box.select_row(Some(&source_row));
+            ui_for_drop.schedule_session_save();
+            true
+        });
+        row.add_controller(drop_target);
+
         let ui_for_close = Rc::clone(self);
         close_button.connect_clicked(move |_| {
             ui_for_close.close_tab(id);

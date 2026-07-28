@@ -32,7 +32,8 @@ const SIDEBAR_CSS: &str = "
 .term-flashy-sidebar row:selected {
     background-color: #3c3c3c;
 }
-.term-flashy-sidebar row.notify {
+.term-flashy-sidebar row.notify,
+.term-flashy-sidebar row.notify:selected {
     background-color: #a35d00;
 }
 .term-flashy-btn {
@@ -117,6 +118,14 @@ struct AppUi {
     pending_session_save: Cell<Option<glib::SourceId>>,
     wallpaper_queue: RefCell<Vec<std::path::PathBuf>>,
     wallpaper_timer: Cell<Option<glib::SourceId>>,
+    // Marking the currently-active tab as pending fights a GTK quirk: closing
+    // the context-menu popover makes the row's own ListBox re-fire
+    // "row-selected" for it (even though it was already selected and stays
+    // selected), which would otherwise immediately strip the "notify" class
+    // we just added. Set right after marking, consumed by the very next
+    // row-selected for that same row, so exactly one such spurious clear is
+    // skipped without suppressing real future ones.
+    suppress_notify_clear: Cell<Option<gtk4::ListBoxRow>>,
 }
 
 // The system's own VTE shell integration (/etc/profile.d/vte-2.91.sh,
@@ -308,24 +317,31 @@ impl AppUi {
             })
         };
 
+        let start_rename: Rc<dyn Fn()> = {
+            let entry_for_start = entry.clone();
+            let label_for_start = label.clone();
+            let ui_for_start = Rc::clone(self);
+            let finish_for_start = Rc::clone(&finish_rename);
+            Rc::new(move || {
+                entry_for_start.set_text(&label_for_start.text());
+                label_for_start.set_visible(false);
+                entry_for_start.set_visible(true);
+                entry_for_start.grab_focus();
+                entry_for_start.select_region(0, -1);
+                let finish_for_stored = Rc::clone(&finish_for_start);
+                *ui_for_start.active_rename.borrow_mut() = Some((
+                    entry_for_start.clone(),
+                    Box::new(move |commit| finish_for_stored(commit)),
+                ));
+            })
+        };
+
         let click_gesture = GestureClick::new();
-        let entry_for_click = entry.clone();
-        let label_for_click = label.clone();
-        let ui_for_click = Rc::clone(self);
-        let finish_for_click = Rc::clone(&finish_rename);
+        let start_rename_for_click = Rc::clone(&start_rename);
         click_gesture.connect_pressed(move |gesture, n_press, _x, _y| {
             if n_press == 2 {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                entry_for_click.set_text(&label_for_click.text());
-                label_for_click.set_visible(false);
-                entry_for_click.set_visible(true);
-                entry_for_click.grab_focus();
-                entry_for_click.select_region(0, -1);
-                let finish_for_stored = Rc::clone(&finish_for_click);
-                *ui_for_click.active_rename.borrow_mut() = Some((
-                    entry_for_click.clone(),
-                    Box::new(move |commit| finish_for_stored(commit)),
-                ));
+                start_rename_for_click();
             }
         });
         label.add_controller(click_gesture);
@@ -368,6 +384,87 @@ impl AppUi {
 
         self.list_box.append(&row);
         self.list_box.select_row(Some(&row));
+
+        // Right-click a tab for a small context menu: rename (same action as
+        // the double-click shortcut), and forcing the orange notify
+        // highlight on manually — same "notify" css class the automatic
+        // triggers use, just applied even while the tab is active. Leaving
+        // the tab and coming back clears it exactly like any other notify,
+        // via the row-selected handler below.
+        let right_click_gesture = GestureClick::new();
+        right_click_gesture.set_button(gdk::BUTTON_SECONDARY);
+        let row_for_menu = row.clone();
+        let window_for_menu = self.window.clone();
+        let start_rename_for_menu = Rc::clone(&start_rename);
+        let ui_for_menu = Rc::clone(self);
+        right_click_gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+            // Parenting the popover to the row itself would make closing it
+            // return keyboard focus to that row — and GTK's ListBox
+            // auto-selects whatever row gains focus, silently switching the
+            // active tab (and, since row-selected clears "notify", undoing
+            // the mark just set). That focus-return turned out to fire
+            // across multiple idle rounds, so it couldn't be reliably
+            // undone after the fact. Parenting to the window instead keeps
+            // the popover outside the row's focus/selection chain entirely
+            // — translate the click point into window coordinates so it
+            // still opens in the same visual spot.
+            let point = row_for_menu
+                .compute_point(&window_for_menu, &gtk4::graphene::Point::new(x as f32, y as f32));
+            let (px, py) = point.map(|p| (p.x(), p.y())).unwrap_or((x as f32, y as f32));
+
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&window_for_menu);
+            popover.set_has_arrow(false);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(px as i32, py as i32, 1, 1)));
+            popover.connect_closed(|popover| popover.unparent());
+
+            let menu_box = GtkBox::new(Orientation::Vertical, 0);
+
+            let rename_button = Button::with_label("Renomear");
+            rename_button.set_has_frame(false);
+            let popover_for_rename = popover.clone();
+            let start_rename_for_click = Rc::clone(&start_rename_for_menu);
+            rename_button.connect_clicked(move |_| {
+                popover_for_rename.popdown();
+                start_rename_for_click();
+            });
+            menu_box.append(&rename_button);
+
+            let pending_label = if row_for_menu.has_css_class("notify") {
+                "Remover marcação"
+            } else {
+                "Marcar como pendente"
+            };
+            let pending_button = Button::with_label(pending_label);
+            pending_button.set_has_frame(false);
+            let popover_for_pending = popover.clone();
+            let row_for_pending_click = row_for_menu.clone();
+            let ui_for_pending = Rc::clone(&ui_for_menu);
+            pending_button.connect_clicked(move |_| {
+                popover_for_pending.popdown();
+                // Closing the popover can trigger GTK to re-fire
+                // "row-selected" for the row it was anchored near, even
+                // when that row was already selected and stays selected —
+                // which would otherwise immediately clear the "notify"
+                // class right back off. Arm the guard so the next
+                // row-selected for this exact row is skipped once.
+                if row_for_pending_click.has_css_class("notify") {
+                    row_for_pending_click.remove_css_class("notify");
+                } else {
+                    row_for_pending_click.add_css_class("notify");
+                    ui_for_pending
+                        .suppress_notify_clear
+                        .set(Some(row_for_pending_click.clone()));
+                }
+            });
+            menu_box.append(&pending_button);
+
+            popover.set_child(Some(&menu_box));
+            popover.popup();
+        });
+        row.add_controller(right_click_gesture);
 
         // Drag-and-drop tab reordering: each row can be picked up (carrying
         // its tab id as the drag payload) and dropped onto another row to
@@ -836,6 +933,7 @@ fn build_ui(app: &Application) {
         pending_session_save: Cell::new(None),
         wallpaper_queue: RefCell::new(Vec::new()),
         wallpaper_timer: Cell::new(None),
+        suppress_notify_clear: Cell::new(None),
     });
     ui.restart_wallpaper_rotation();
 
@@ -855,7 +953,16 @@ fn build_ui(app: &Application) {
     let ui_for_selection = Rc::clone(&ui);
     list_box.connect_row_selected(move |_, row| {
         if let Some(row) = row {
-            row.remove_css_class("notify");
+            let guard = ui_for_selection.suppress_notify_clear.take();
+            let suppressed = guard.as_ref() == Some(row);
+            if suppressed {
+                // Consumed: this was the spurious reselect right after
+                // marking this row pending, not a real navigation away
+                // and back. Leave "notify" alone.
+            } else {
+                ui_for_selection.suppress_notify_clear.set(guard);
+                row.remove_css_class("notify");
+            }
             ui_for_selection
                 .stack
                 .set_visible_child_name(&row.widget_name());

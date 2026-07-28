@@ -65,9 +65,17 @@ fn terminal_cwd_uri(terminal: &vte4::Terminal) -> Option<glib::GString> {
     terminal.current_directory_uri()
 }
 
-fn mark_tab_notify(stack: &Stack, page_name: &str, row: &gtk4::ListBoxRow) {
+fn mark_tab_notify(stack: &Stack, page_name: &str, row: &gtk4::ListBoxRow, window: &ApplicationWindow) {
     if stack.visible_child_name().as_deref() != Some(page_name) {
         row.add_css_class("notify");
+    }
+    // Ask the compositor to (re-)activate our own already-mapped window.
+    // On Wayland this goes through xdg-activation; a wlroots compositor
+    // like Sway won't steal focus for it (per focus_on_window_activation),
+    // it just flags the window/workspace as urgent — exactly the "something
+    // happened over there" signal browsers give for background notifications.
+    if !window.is_active() {
+        window.present();
     }
 }
 
@@ -98,6 +106,7 @@ struct TabEntry {
 
 struct AppUi {
     app: Application,
+    window: ApplicationWindow,
     stack: Stack,
     list_box: ListBox,
     background_picture: Picture,
@@ -421,10 +430,16 @@ impl AppUi {
         let stack_for_bell = self.stack.clone();
         let row_for_bell = row.clone();
         let page_name_for_bell = page_name.clone();
+        let window_for_bell = self.window.clone();
         let trigger_bell = self.config.borrow().trigger_bell;
         terminal.connect_bell(move |_terminal| {
             if trigger_bell {
-                mark_tab_notify(&stack_for_bell, &page_name_for_bell, &row_for_bell);
+                mark_tab_notify(
+                    &stack_for_bell,
+                    &page_name_for_bell,
+                    &row_for_bell,
+                    &window_for_bell,
+                );
             }
         });
 
@@ -444,6 +459,7 @@ impl AppUi {
         let stack_for_exit = self.stack.clone();
         let row_for_exit = row.clone();
         let page_name_for_exit = page_name.clone();
+        let window_for_exit = self.window.clone();
         let trigger_exit_code = self.config.borrow().trigger_exit_code;
         let trigger_long_command = self.config.borrow().trigger_long_command;
         let long_command_threshold = self.config.borrow().long_command_threshold();
@@ -454,7 +470,12 @@ impl AppUi {
                     .take()
                     .is_some_and(|start| start.elapsed() >= long_command_threshold);
             if (trigger_exit_code && exit_code != 0) || long_running {
-                mark_tab_notify(&stack_for_exit, &page_name_for_exit, &row_for_exit);
+                mark_tab_notify(
+                    &stack_for_exit,
+                    &page_name_for_exit,
+                    &row_for_exit,
+                    &window_for_exit,
+                );
             }
         });
 
@@ -804,6 +825,7 @@ fn build_ui(app: &Application) {
 
     let ui = Rc::new(AppUi {
         app: app.clone(),
+        window: window.clone(),
         stack,
         list_box: list_box.clone(),
         background_picture: background_picture.clone(),

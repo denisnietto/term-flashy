@@ -127,6 +127,13 @@ reopened settings window reflect the persisted values.
 - `font_family` (default: unset → "Monospace", resolves via
   fontconfig) and `font_size` (default 11.0), applied per-tab via
   `Terminal::set_font`.
+- Transient per-tab font zoom (done): Ctrl+'+'/Ctrl+'-' (and the
+  Ctrl+Shift variants, since '+' and '_' need Shift on most layouts,
+  plus the numpad keys) grow/shrink only the focused tab's own VTE
+  font in memory (`adjust_font_size`, reads `terminal.font()`, adjusts
+  the `pango::FontDescription` size, calls `set_font` back) — never
+  touches `AppUi.config`, so it doesn't persist to `config.toml` and
+  doesn't affect other tabs, unlike the Settings font size field above.
 - `trigger_bell`, `trigger_exit_code`, `trigger_long_command`: each
   built-in trigger individually disableable (per-trigger config →
   style mapping from the Phase 3 wishlist not implemented — all

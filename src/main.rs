@@ -66,6 +66,18 @@ fn terminal_cwd_uri(terminal: &vte4::Terminal) -> Option<glib::GString> {
     terminal.current_directory_uri()
 }
 
+// Ctrl+'+'/Ctrl+Shift+'-' zoom: adjusts only this tab's own VTE font, in
+// memory. Never touches `AppUi.config`, so it doesn't persist and doesn't
+// affect other tabs or newly opened ones.
+fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) {
+    let mut desc = terminal
+        .font()
+        .unwrap_or_else(|| pango::FontDescription::from_string("Monospace 11"));
+    let new_size = (desc.size() as f64 / pango::SCALE as f64 + delta).clamp(6.0, 72.0);
+    desc.set_size((new_size * pango::SCALE as f64) as i32);
+    terminal.set_font(Some(&desc));
+}
+
 fn mark_tab_notify(stack: &Stack, page_name: &str, row: &gtk4::ListBoxRow, window: &ApplicationWindow) {
     if stack.visible_child_name().as_deref() != Some(page_name) {
         row.add_css_class("notify");
@@ -275,6 +287,19 @@ impl AppUi {
                     }
                     gdk::Key::V | gdk::Key::v => {
                         terminal_for_keys.paste_clipboard();
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
+            if state.contains(gdk::ModifierType::CONTROL_MASK) {
+                match keyval {
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+                        adjust_font_size(&terminal_for_keys, 1.0);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => {
+                        adjust_font_size(&terminal_for_keys, -1.0);
                         return glib::Propagation::Stop;
                     }
                     _ => {}

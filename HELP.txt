@@ -9,7 +9,16 @@ FEATURES
 Multiple tabs with a sidebar
   Each tab runs its own independent shell process. The sidebar is
   resizable (drag the divider) and remembers its width between runs.
-  Double-click a tab's name to rename it.
+  Double-click a tab's name to rename it, or right-click it for a menu
+  (rename, or mark it orange as a manual "come back to this" reminder
+  — clears automatically once you leave and return to the tab).
+
+Per-tab font zoom
+  Ctrl+'+' / Ctrl+'-' (also Ctrl+Shift+'+' / Ctrl+Shift+'-', and the
+  numpad +/-) grow or shrink the font size of the current tab only.
+  This is a temporary, in-memory change — it isn't saved, doesn't
+  affect other tabs, and resets on restart. To change the font size
+  permanently for all tabs, use Settings.
 
 Background image (optional)
   Show an image behind the terminal text, like a desktop wallpaper,

@@ -541,7 +541,7 @@ impl AppUi {
 
         let ui_for_close = Rc::clone(self);
         close_button.connect_clicked(move |_| {
-            ui_for_close.close_tab(id);
+            ui_for_close.confirm_close_tab(id);
         });
 
         let ui_for_exit = Rc::clone(self);
@@ -698,6 +698,34 @@ impl AppUi {
         if let Some(row) = self.list_box.row_at_index(new_index) {
             self.list_box.select_row(Some(&row));
         }
+    }
+
+    /// Asks before closing a tab, so a misclick on the close button doesn't
+    /// kill a running shell. Only guards the button; a shell that exits on
+    /// its own still closes its tab silently.
+    fn confirm_close_tab(self: &Rc<Self>, id: u32) {
+        let Some(title) = self
+            .tabs
+            .borrow()
+            .get(&id)
+            .map(|entry| entry.label.text().to_string())
+        else {
+            return;
+        };
+        let dialog = gtk4::AlertDialog::builder()
+            .modal(true)
+            .message(format!("Fechar a aba \"{title}\"?"))
+            .detail("O que estiver rodando nela será encerrado.")
+            .buttons(["Cancelar", "Fechar"])
+            .default_button(0)
+            .cancel_button(0)
+            .build();
+        let ui = Rc::clone(self);
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            if matches!(result, Ok(1)) {
+                ui.close_tab(id);
+            }
+        });
     }
 
     fn close_tab(self: &Rc<Self>, id: u32) {

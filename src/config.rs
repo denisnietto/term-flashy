@@ -24,8 +24,9 @@ pub struct Config {
     /// How often (in seconds) to switch to the next image when
     /// `background_folder` is set.
     pub background_rotate_interval_secs: u64,
-    /// Restore open tabs and each tab's working directory on startup,
-    /// continuously saved as they change (not just on clean quit).
+    /// Restore open tabs, each tab's working directory and its pending
+    /// highlight on startup, continuously saved as they change (not just
+    /// on clean quit).
     pub restore_session: bool,
 }
 

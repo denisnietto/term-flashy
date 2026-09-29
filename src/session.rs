@@ -10,6 +10,9 @@ pub struct SessionState {
 pub struct TabState {
     pub title: String,
     pub cwd: Option<String>,
+    /// Whether the tab was showing the pending highlight.
+    #[serde(default)]
+    pub notify: bool,
 }
 
 fn session_file_path() -> std::path::PathBuf {

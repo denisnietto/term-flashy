@@ -78,20 +78,6 @@ fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) {
     terminal.set_font(Some(&desc));
 }
 
-fn mark_tab_notify(stack: &Stack, page_name: &str, row: &gtk4::ListBoxRow, window: &ApplicationWindow) {
-    if stack.visible_child_name().as_deref() != Some(page_name) {
-        row.add_css_class("notify");
-    }
-    // Ask the compositor to (re-)activate our own already-mapped window.
-    // On Wayland this goes through xdg-activation; a wlroots compositor
-    // like Sway won't steal focus for it (per focus_on_window_activation),
-    // it just flags the window/workspace as urgent — exactly the "something
-    // happened over there" signal browsers give for background notifications.
-    if !window.is_active() {
-        window.present();
-    }
-}
-
 fn state_file_path() -> std::path::PathBuf {
     glib::user_config_dir().join("term-flashy").join("state.txt")
 }
@@ -182,6 +168,21 @@ fn scan_wallpaper_folder(folder: &str) -> Vec<std::path::PathBuf> {
 }
 
 impl AppUi {
+    fn mark_tab_notify(self: &Rc<Self>, page_name: &str, row: &gtk4::ListBoxRow) {
+        if self.stack.visible_child_name().as_deref() != Some(page_name) {
+            row.add_css_class("notify");
+            self.schedule_session_save();
+        }
+        // Ask the compositor to (re-)activate our own already-mapped window.
+        // On Wayland this goes through xdg-activation; a wlroots compositor
+        // like Sway won't steal focus for it (per focus_on_window_activation),
+        // it just flags the window/workspace as urgent — exactly the "something
+        // happened over there" signal browsers give for background notifications.
+        if !self.window.is_active() {
+            self.window.present();
+        }
+    }
+
     /// Picks the next background image: refills and shuffles the queue
     /// (a fresh lap through every image in `background_folder`, so none
     /// repeats until all have shown once) when it runs out.
@@ -483,6 +484,7 @@ impl AppUi {
                         .suppress_notify_clear
                         .set(Some(row_for_pending_click.clone()));
                 }
+                ui_for_pending.schedule_session_save();
             });
             menu_box.append(&pending_button);
 
@@ -549,19 +551,13 @@ impl AppUi {
             ui_for_exit.close_tab(id);
         });
 
-        let stack_for_bell = self.stack.clone();
+        let ui_for_bell = Rc::clone(self);
         let row_for_bell = row.clone();
         let page_name_for_bell = page_name.clone();
-        let window_for_bell = self.window.clone();
         let trigger_bell = self.config.borrow().trigger_bell;
         terminal.connect_bell(move |_terminal| {
             if trigger_bell {
-                mark_tab_notify(
-                    &stack_for_bell,
-                    &page_name_for_bell,
-                    &row_for_bell,
-                    &window_for_bell,
-                );
+                ui_for_bell.mark_tab_notify(&page_name_for_bell, &row_for_bell);
             }
         });
 
@@ -578,10 +574,9 @@ impl AppUi {
             command_started_for_preexec.set(Some(Instant::now()));
         });
 
-        let stack_for_exit = self.stack.clone();
+        let ui_for_postexec = Rc::clone(self);
         let row_for_exit = row.clone();
         let page_name_for_exit = page_name.clone();
-        let window_for_exit = self.window.clone();
         let trigger_exit_code = self.config.borrow().trigger_exit_code;
         let trigger_long_command = self.config.borrow().trigger_long_command;
         let long_command_threshold = self.config.borrow().long_command_threshold();
@@ -592,12 +587,7 @@ impl AppUi {
                     .take()
                     .is_some_and(|start| start.elapsed() >= long_command_threshold);
             if (trigger_exit_code && exit_code != 0) || long_running {
-                mark_tab_notify(
-                    &stack_for_exit,
-                    &page_name_for_exit,
-                    &row_for_exit,
-                    &window_for_exit,
-                );
+                ui_for_postexec.mark_tab_notify(&page_name_for_exit, &row_for_exit);
             }
         });
 
@@ -662,6 +652,7 @@ impl AppUi {
                 saved_tabs.push(session::TabState {
                     title: entry.label.text().to_string(),
                     cwd,
+                    notify: entry.row.has_css_class("notify"),
                 });
             }
             index += 1;
@@ -855,7 +846,7 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     root.append(&bg_dim_row);
 
     let restore_session_check =
-        gtk4::CheckButton::with_label("Restore open tabs and directories on startup");
+        gtk4::CheckButton::with_label("Restore open tabs, directories and pending marks");
     restore_session_check.set_active(current.restore_session);
     root.append(&restore_session_check);
 
@@ -1106,6 +1097,7 @@ fn build_ui(app: &Application) {
     if saved_session.tabs.is_empty() {
         ui.add_tab(None);
     } else {
+        let pending: Vec<bool> = saved_session.tabs.iter().map(|tab| tab.notify).collect();
         for tab in saved_session.tabs {
             ui.add_tab(Some(tab));
         }
@@ -1114,6 +1106,13 @@ fn build_ui(app: &Application) {
             .row_at_index(saved_session.active as i32)
             .or_else(|| ui.list_box.row_at_index(0));
         ui.list_box.select_row(active_row.as_ref());
+        // Only after the startup selection: adding a row selects it, and
+        // row-selected strips "notify".
+        for (index, _) in pending.iter().enumerate().filter(|(_, mark)| **mark) {
+            if let Some(row) = ui.list_box.row_at_index(index as i32) {
+                row.add_css_class("notify");
+            }
+        }
     }
 
     window.present();

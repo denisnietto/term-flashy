@@ -9,7 +9,7 @@ use std::time::Instant;
 use gtk4::prelude::*;
 use gtk4::{gdk, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey};
 use gtk4::{Entry, GestureClick, Label, ListBox, Orientation, Overlay, Paned, PolicyType};
-use gtk4::{Picture, ScrolledWindow, SelectionMode, Stack};
+use gtk4::{Picture, ScrolledWindow, SearchEntry, SelectionMode, Stack};
 use vte4::{Format, PtyFlags, TerminalExt, TerminalExtManual};
 
 use config::Config;
@@ -78,6 +78,107 @@ fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) {
     terminal.set_font(Some(&desc));
 }
 
+const PCRE2_CASELESS: u32 = 0x0000_0008;
+const PCRE2_MULTILINE: u32 = 0x0000_0400;
+const PCRE2_UTF: u32 = 0x0008_0000;
+
+/// Sets `text` as the terminal's literal search pattern; case-insensitive
+/// unless it has an uppercase letter.
+fn set_search_text(terminal: &vte4::Terminal, text: &str) {
+    if text.is_empty() {
+        terminal.search_set_regex(None, 0);
+        terminal.unselect_all();
+        return;
+    }
+    let mut flags = PCRE2_UTF | PCRE2_MULTILINE;
+    if !text.chars().any(char::is_uppercase) {
+        flags |= PCRE2_CASELESS;
+    }
+    match vte4::Regex::for_search(&glib::Regex::escape_string(text), flags) {
+        Ok(regex) => terminal.search_set_regex(Some(&regex), 0),
+        Err(err) => eprintln!("term-flashy: invalid search pattern: {err}"),
+    }
+}
+
+/// Hidden search bar shown under a tab's terminal by Ctrl+Shift+F.
+/// Enter/↑ go to older matches, Shift+Enter/↓ to newer ones, Escape closes.
+fn build_search_bar(terminal: &vte4::Terminal) -> (GtkBox, SearchEntry) {
+    terminal.search_set_wrap_around(true);
+
+    let bar = GtkBox::new(Orientation::Horizontal, 4);
+    bar.add_css_class("term-flashy-sidebar");
+    bar.set_visible(false);
+
+    let entry = SearchEntry::new();
+    entry.set_hexpand(true);
+    entry.set_margin_start(4);
+    entry.set_margin_top(4);
+    entry.set_margin_bottom(4);
+    entry.set_placeholder_text(Some("Search history"));
+    bar.append(&entry);
+
+    let older_button = Button::from_icon_name("go-up-symbolic");
+    let newer_button = Button::from_icon_name("go-down-symbolic");
+    let close_button = Button::from_icon_name("window-close-symbolic");
+    for button in [&older_button, &newer_button, &close_button] {
+        button.set_has_frame(false);
+        button.add_css_class("term-flashy-btn");
+        button.set_valign(gtk4::Align::Center);
+        bar.append(button);
+    }
+    close_button.set_margin_end(4);
+
+    let close: Rc<dyn Fn()> = {
+        let bar = bar.clone();
+        let terminal = terminal.clone();
+        Rc::new(move || {
+            bar.set_visible(false);
+            terminal.grab_focus();
+        })
+    };
+
+    let terminal_for_change = terminal.clone();
+    entry.connect_search_changed(move |entry| {
+        set_search_text(&terminal_for_change, &entry.text());
+        terminal_for_change.search_find_previous();
+    });
+
+    let terminal_for_activate = terminal.clone();
+    entry.connect_activate(move |_| {
+        terminal_for_activate.search_find_previous();
+    });
+
+    let terminal_for_keys = terminal.clone();
+    let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+        let is_enter = matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter);
+        if is_enter && state.contains(gdk::ModifierType::SHIFT_MASK) {
+            terminal_for_keys.search_find_next();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    entry.add_controller(key_controller);
+
+    let close_for_stop = Rc::clone(&close);
+    entry.connect_stop_search(move |_| close_for_stop());
+
+    let terminal_for_older = terminal.clone();
+    older_button.connect_clicked(move |_| {
+        terminal_for_older.search_find_previous();
+    });
+
+    let terminal_for_newer = terminal.clone();
+    newer_button.connect_clicked(move |_| {
+        terminal_for_newer.search_find_next();
+    });
+
+    close_button.connect_clicked(move |_| close());
+
+    (bar, entry)
+}
+
 fn state_file_path() -> std::path::PathBuf {
     glib::user_config_dir().join("term-flashy").join("state.txt")
 }
@@ -98,7 +199,10 @@ fn save_sidebar_width(width: i32) {
 }
 
 struct TabEntry {
+    page: GtkBox,
     terminal: vte4::Terminal,
+    search_bar: GtkBox,
+    search_entry: SearchEntry,
     row: gtk4::ListBoxRow,
     label: Label,
 }
@@ -310,8 +414,14 @@ impl AppUi {
             glib::Propagation::Proceed
         });
         terminal.add_controller(key_controller);
+        terminal.set_vexpand(true);
 
-        self.stack.add_named(&terminal, Some(&page_name));
+        let (search_bar, search_entry) = build_search_bar(&terminal);
+        let page = GtkBox::new(Orientation::Vertical, 0);
+        page.add_css_class("term-flashy-transparent");
+        page.append(&terminal);
+        page.append(&search_bar);
+        self.stack.add_named(&page, Some(&page_name));
 
         let label = Label::new(Some(
             &restore_title.unwrap_or_else(|| format!("Tab {}", id + 1)),
@@ -604,7 +714,10 @@ impl AppUi {
         self.tabs.borrow_mut().insert(
             id,
             TabEntry {
+                page,
                 terminal,
+                search_bar,
+                search_entry,
                 row,
                 label,
             },
@@ -686,6 +799,23 @@ impl AppUi {
         }
     }
 
+    fn with_visible_tab<R>(&self, f: impl FnOnce(&TabEntry) -> R) -> Option<R> {
+        let child = self.stack.visible_child()?;
+        self.tabs
+            .borrow()
+            .values()
+            .find(|entry| *entry.page.upcast_ref::<gtk4::Widget>() == child)
+            .map(f)
+    }
+
+    fn open_search(&self) {
+        self.with_visible_tab(|tab| {
+            tab.search_bar.set_visible(true);
+            tab.search_entry.grab_focus();
+            tab.search_entry.select_region(0, -1);
+        });
+    }
+
     fn select_adjacent_tab(self: &Rc<Self>, delta: i32) {
         let Some(current) = self.list_box.selected_row() else {
             return;
@@ -730,7 +860,7 @@ impl AppUi {
     fn close_tab(self: &Rc<Self>, id: u32) {
         let entry = self.tabs.borrow_mut().remove(&id);
         if let Some(entry) = entry {
-            self.stack.remove(&entry.terminal);
+            self.stack.remove(&entry.page);
             self.list_box.remove(&entry.row);
         }
         self.schedule_session_save();
@@ -1045,11 +1175,9 @@ fn build_ui(app: &Application) {
             ui_for_selection
                 .stack
                 .set_visible_child_name(&row.widget_name());
-            let stack_for_focus = ui_for_selection.stack.clone();
+            let ui_for_focus = Rc::clone(&ui_for_selection);
             glib::idle_add_local_once(move || {
-                if let Some(child) = stack_for_focus.visible_child() {
-                    child.grab_focus();
-                }
+                ui_for_focus.with_visible_tab(|tab| tab.terminal.grab_focus());
             });
             ui_for_selection.schedule_session_save();
         }
@@ -1107,6 +1235,10 @@ fn build_ui(app: &Application) {
             match keyval {
                 gdk::Key::T | gdk::Key::t => {
                     ui_for_shortcut.add_tab(None);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::F | gdk::Key::f => {
+                    ui_for_shortcut.open_search();
                     return glib::Propagation::Stop;
                 }
                 gdk::Key::Up => {

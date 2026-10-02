@@ -20,6 +20,13 @@ Per-tab font zoom
   affect other tabs, and resets on restart. To change the font size
   permanently for all tabs, use Settings.
 
+Search in history
+  Ctrl+Shift+F opens a search bar under the current tab. Enter (or ↑)
+  jumps to the previous, older match; Shift+Enter (or ↓) to the next,
+  newer one; Escape closes it. Case-insensitive unless the text has an
+  uppercase letter. How far back it reaches depends on the scrollback
+  size in Settings.
+
 Background image (optional)
   Show an image behind the terminal text, like a desktop wallpaper,
   with a configurable dim level so text stays readable. (Real

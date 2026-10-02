@@ -11,6 +11,10 @@ Each tab runs its own independent shell process. The sidebar is
 resizable (drag the divider) and remembers its width between runs.
 Double-click a tab's name to rename it.
 
+**Search in history**
+Ctrl+Shift+F opens a search bar under the current tab to find text
+in its scrollback.
+
 **Background image (optional)**
 Show an image behind the terminal text, like a desktop wallpaper,
 with a configurable dim level so text stays readable. Real window

@@ -44,7 +44,8 @@ in the sidebar until you click it. There are two kinds of trigger:
 
 **Configurable**
 `~/.config/term-flashy/config.toml` (or the in-app Settings window):
-font family, font size, background image and dim level, and each
+font family, font size, background image and dim level, scrollback
+size (10,000 lines by default, or unlimited), and each
 built-in trigger can be turned on or off individually. Changes apply
 immediately to already-open tabs, no restart needed.
 

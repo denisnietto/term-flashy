@@ -28,6 +28,8 @@ pub struct Config {
     /// highlight on startup, continuously saved as they change (not just
     /// on clean quit).
     pub restore_session: bool,
+    /// Lines of history kept per tab; -1 = unlimited.
+    pub scrollback_lines: i64,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             background_folder: None,
             background_rotate_interval_secs: 300,
             restore_session: true,
+            scrollback_lines: 10_000,
         }
     }
 }

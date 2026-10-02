@@ -259,7 +259,8 @@ impl AppUi {
             )),
             &[],
         );
-        let restore_dir = restore.as_ref().and_then(|r| r.cwd.as_deref());
+        terminal.set_scrollback_lines(self.config.borrow().scrollback_lines as _);
+        let restore_dir =restore.as_ref().and_then(|r| r.cwd.as_deref());
         let restore_title = restore.as_ref().map(|r| r.title.clone());
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let envv = shell_env(&shell);
@@ -678,6 +679,13 @@ impl AppUi {
         }
     }
 
+    fn apply_scrollback_settings(&self) {
+        let lines = self.config.borrow().scrollback_lines;
+        for entry in self.tabs.borrow().values() {
+            entry.terminal.set_scrollback_lines(lines as _);
+        }
+    }
+
     fn select_adjacent_tab(self: &Rc<Self>, delta: i32) {
         let Some(current) = self.list_box.selected_row() else {
             return;
@@ -850,6 +858,27 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     restore_session_check.set_active(current.restore_session);
     root.append(&restore_session_check);
 
+    let scrollback_row = GtkBox::new(Orientation::Horizontal, 8);
+    scrollback_row.append(&Label::new(Some("Scrollback lines")));
+    let scrollback_spin = gtk4::SpinButton::with_range(100.0, 1_000_000.0, 1000.0);
+    scrollback_spin.set_value(if current.scrollback_lines < 0 {
+        Config::default().scrollback_lines as f64
+    } else {
+        current.scrollback_lines as f64
+    });
+    scrollback_spin.set_hexpand(true);
+    scrollback_row.append(&scrollback_spin);
+    root.append(&scrollback_row);
+
+    let scrollback_unlimited_check = gtk4::CheckButton::with_label("Unlimited scrollback");
+    scrollback_unlimited_check.set_active(current.scrollback_lines < 0);
+    scrollback_spin.set_sensitive(current.scrollback_lines >= 0);
+    let scrollback_spin_for_toggle = scrollback_spin.clone();
+    scrollback_unlimited_check.connect_toggled(move |check| {
+        scrollback_spin_for_toggle.set_sensitive(!check.is_active());
+    });
+    root.append(&scrollback_unlimited_check);
+
     drop(current);
 
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -886,10 +915,16 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
             background_rotate_interval_secs: bg_rotate_spin.value() as u64,
             background_dim: bg_dim_spin.value() / 100.0,
             restore_session: restore_session_check.is_active(),
+            scrollback_lines: if scrollback_unlimited_check.is_active() {
+                -1
+            } else {
+                scrollback_spin.value() as i64
+            },
         };
         config::save(&new_config);
         *ui_for_save.config.borrow_mut() = new_config;
         ui_for_save.apply_background_settings();
+        ui_for_save.apply_scrollback_settings();
         window_for_save.close();
     });
 

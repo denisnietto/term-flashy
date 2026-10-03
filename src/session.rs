@@ -13,6 +13,9 @@ pub struct TabState {
     /// Whether the tab was showing the pending highlight.
     #[serde(default)]
     pub notify: bool,
+    /// Font size set by this tab's own zoom; `None` = follows the default.
+    #[serde(default)]
+    pub font_size: Option<f64>,
 }
 
 fn session_file_path() -> std::path::PathBuf {

@@ -66,16 +66,17 @@ fn terminal_cwd_uri(terminal: &vte4::Terminal) -> Option<glib::GString> {
     terminal.current_directory_uri()
 }
 
-// Ctrl+'+'/Ctrl+Shift+'-' zoom: adjusts only this tab's own VTE font, in
-// memory. Never touches `AppUi.config`, so it doesn't persist and doesn't
-// affect other tabs or newly opened ones.
-fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) {
+// Ctrl+'+'/Ctrl+Shift+'-' zoom: adjusts only this tab's own VTE font and
+// returns the new size, saved with the session. Never touches the default
+// in `AppUi.config`.
+fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) -> f64 {
     let mut desc = terminal
         .font()
         .unwrap_or_else(|| pango::FontDescription::from_string("Monospace 11"));
     let new_size = (desc.size() as f64 / pango::SCALE as f64 + delta).clamp(6.0, 72.0);
     desc.set_size((new_size * pango::SCALE as f64) as i32);
     terminal.set_font(Some(&desc));
+    new_size
 }
 
 const PCRE2_CASELESS: u32 = 0x0000_0008;
@@ -203,6 +204,8 @@ struct TabEntry {
     terminal: vte4::Terminal,
     search_bar: GtkBox,
     search_entry: SearchEntry,
+    /// Size from this tab's own zoom; `None` = follows the default.
+    font_size: Rc<Cell<Option<f64>>>,
     row: gtk4::ListBoxRow,
     label: Label,
 }
@@ -350,8 +353,9 @@ impl AppUi {
 
         let terminal = vte4::Terminal::new();
         terminal.add_css_class("term-flashy-transparent");
+        let font_size = Rc::new(Cell::new(restore.as_ref().and_then(|r| r.font_size)));
         terminal.set_font(Some(&pango::FontDescription::from_string(
-            &self.config.borrow().font_description(),
+            &self.config.borrow().font_description(font_size.get()),
         )));
         terminal.set_colors(
             None,
@@ -364,7 +368,7 @@ impl AppUi {
             &[],
         );
         terminal.set_scrollback_lines(self.config.borrow().scrollback_lines as _);
-        let restore_dir =restore.as_ref().and_then(|r| r.cwd.as_deref());
+        let restore_dir = restore.as_ref().and_then(|r| r.cwd.as_deref());
         let restore_title = restore.as_ref().map(|r| r.title.clone());
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let envv = shell_env(&shell);
@@ -382,6 +386,13 @@ impl AppUi {
         );
 
         let key_controller = EventControllerKey::new();
+        let terminal_for_keys = terminal.clone();
+        let font_size_for_keys = Rc::clone(&font_size);
+        let ui_for_keys = Rc::clone(self);
+        let zoom = move |delta: f64| {
+            font_size_for_keys.set(Some(adjust_font_size(&terminal_for_keys, delta)));
+            ui_for_keys.schedule_session_save();
+        };
         let terminal_for_keys = terminal.clone();
         key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
             let ctrl_shift = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
@@ -401,11 +412,11 @@ impl AppUi {
             if state.contains(gdk::ModifierType::CONTROL_MASK) {
                 match keyval {
                     gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
-                        adjust_font_size(&terminal_for_keys, 1.0);
+                        zoom(1.0);
                         return glib::Propagation::Stop;
                     }
                     gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => {
-                        adjust_font_size(&terminal_for_keys, -1.0);
+                        zoom(-1.0);
                         return glib::Propagation::Stop;
                     }
                     _ => {}
@@ -718,6 +729,7 @@ impl AppUi {
                 terminal,
                 search_bar,
                 search_entry,
+                font_size,
                 row,
                 label,
             },
@@ -767,6 +779,7 @@ impl AppUi {
                     title: entry.label.text().to_string(),
                     cwd,
                     notify: entry.row.has_css_class("notify"),
+                    font_size: entry.font_size.get(),
                 });
             }
             index += 1;
@@ -789,6 +802,16 @@ impl AppUi {
             entry
                 .terminal
                 .set_colors(None, Some(&gdk::RGBA::new(0.0, 0.0, 0.0, alpha)), &[]);
+        }
+    }
+
+    /// Applies the configured font; zoomed tabs keep their own size.
+    fn apply_font_settings(&self) {
+        let config = self.config.borrow();
+        for entry in self.tabs.borrow().values() {
+            entry.terminal.set_font(Some(&pango::FontDescription::from_string(
+                &config.font_description(entry.font_size.get()),
+            )));
         }
     }
 
@@ -1055,6 +1078,7 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
         *ui_for_save.config.borrow_mut() = new_config;
         ui_for_save.apply_background_settings();
         ui_for_save.apply_scrollback_settings();
+        ui_for_save.apply_font_settings();
         window_for_save.close();
     });
 

@@ -16,9 +16,9 @@ Multiple tabs with a sidebar
 Per-tab font zoom
   Ctrl+'+' / Ctrl+'-' (also Ctrl+Shift+'+' / Ctrl+Shift+'-', and the
   numpad +/-) grow or shrink the font size of the current tab only.
-  This is a temporary, in-memory change — it isn't saved, doesn't
-  affect other tabs, and resets on restart. To change the font size
-  permanently for all tabs, use Settings.
+  The size is saved with the session and restored with the tab, but
+  doesn't affect other tabs or the default. Tabs never zoomed follow
+  the default font size from Settings; zoomed tabs keep their own.
 
 Search in history
   Ctrl+Shift+F opens a search bar under the current tab. Enter (or ↑)

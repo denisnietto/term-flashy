@@ -52,9 +52,10 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn font_description(&self) -> String {
+    /// Configured font family at `size`, or at the default size if `None`.
+    pub fn font_description(&self, size: Option<f64>) -> String {
         let family = self.font_family.as_deref().unwrap_or("Monospace");
-        format!("{family} {}", self.font_size)
+        format!("{family} {}", size.unwrap_or(self.font_size))
     }
 
     pub fn long_command_threshold(&self) -> std::time::Duration {

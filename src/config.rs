@@ -30,6 +30,10 @@ pub struct Config {
     pub restore_session: bool,
     /// Lines of history kept per tab; -1 = unlimited.
     pub scrollback_lines: i64,
+    /// Lets `term-flashy attach` (e.g. from an SSH session) drive tabs
+    /// opened while this is on. Off by default: any process running as
+    /// this user can then type into those tabs.
+    pub attach_enabled: bool,
 }
 
 impl Default for Config {
@@ -47,6 +51,7 @@ impl Default for Config {
             background_rotate_interval_secs: 300,
             restore_session: true,
             scrollback_lines: 10_000,
+            attach_enabled: false,
         }
     }
 }

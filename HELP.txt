@@ -56,6 +56,29 @@ Per-tab notifications
     responding or needs a permission decision, even while you're
     working in a different tab.
 
+Attach from another terminal (e.g. over SSH)
+  `term-flashy attach` lists the tabs of every running term-flashy and
+  lets you work inside one from any terminal on this machine — an SSH
+  session from a phone, for instance. Off by default: turn on "Allow
+  term-flashy attach" in Settings (applies to tabs opened afterwards).
+
+  Menu: arrows / PgUp / PgDn / Home / End / mouse wheel scroll, `/`
+  filters by name, Enter (or a tap) enters the tab, `c` opens a new tab
+  next to the selected one (same folder), `r` renames it, `x` closes it
+  (asks first), `n`/`p` jump to the next/previous tab, Esc returns to
+  the current tab, `?` shows all keys, `q` quits.
+  Inside a tab, Ctrl+] opens the menu; Ctrl+] in the menu sends a
+  literal Ctrl+] to the tab.
+
+  While attached, the tab takes your terminal's size (restored when you
+  leave), shows ⇄ in the sidebar and doesn't get the pending highlight.
+  Right-click a tab → "Bloquear attach" to refuse connections to it.
+  Connections are logged to ~/.local/state/term-flashy/attach.log.
+
+  Security: any program running as your user can type into attachable
+  tabs (same trade-off as tmux). Keep it off if you don't use it, block
+  sensitive tabs, and use key-only SSH authentication.
+
 Configurable
   `~/.config/term-flashy/config.toml` (or the in-app Settings window):
   font family, font size, background image and dim level, and each
@@ -92,6 +115,7 @@ USAGE
 
   term-flashy            Start the app
   term-flashy --help     Show this text
+  term-flashy attach     Drive tabs from another terminal (see above)
   term-flashy-notify     Flag the current tab (ring the bell) from
                           inside a shell or a hook command
 

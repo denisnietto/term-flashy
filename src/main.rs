@@ -1,8 +1,15 @@
+mod attach;
+mod attach_ipc;
 mod config;
+mod control;
+mod pty_host;
 mod session;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -69,6 +76,14 @@ fn terminal_cwd_uri(terminal: &vte4::Terminal) -> Option<glib::GString> {
 // Ctrl+'+'/Ctrl+Shift+'-' zoom: adjusts only this tab's own VTE font and
 // returns the new size, saved with the session. Never touches the default
 // in `AppUi.config`.
+fn terminal_cwd(terminal: &vte4::Terminal) -> Option<String> {
+    terminal_cwd_uri(terminal)
+        .and_then(|uri| glib::filename_from_uri(&uri).ok())
+        .map(|(path, _hostname)| path)
+        .filter(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn adjust_font_size(terminal: &vte4::Terminal, delta: f64) -> f64 {
     let mut desc = terminal
         .font()
@@ -208,6 +223,246 @@ struct TabEntry {
     font_size: Rc<Cell<Option<f64>>>,
     row: gtk4::ListBoxRow,
     label: Label,
+    attach: Option<Rc<TabAttach>>,
+    attach_blocked: Rc<Cell<bool>>,
+}
+
+/// A tab opened from `term-flashy attach`: placed right after the tab at
+/// `index` without switching the window to it, and always attachable.
+struct FromAttach {
+    index: i32,
+    cwd: Option<String>,
+}
+
+/// Attach state of a tab running under `term-flashy pty-host`.
+struct TabAttach {
+    socket: PathBuf,
+    /// Connected `attach` clients, as reported by the pty-host.
+    clients: Cell<u64>,
+    /// The pty-host's registration connection, used to send block/unblock.
+    host: RefCell<Option<UnixStream>>,
+    indicator: Label,
+}
+
+impl TabAttach {
+    fn send_block(&self, on: bool) {
+        if let Some(host) = self.host.borrow().as_ref() {
+            let line = serde_json::json!({"cmd": "block", "on": on}).to_string() + "\n";
+            let _ = (&*host).write_all(line.as_bytes());
+        }
+    }
+}
+
+thread_local! {
+    /// Every window of this process, for the control socket's tab list.
+    static WINDOWS: RefCell<Vec<std::rc::Weak<AppUi>>> = const { RefCell::new(Vec::new()) };
+    /// (socket dir, control socket), started the first time a tab needs
+    /// it; `None` inside = couldn't start, attach stays off.
+    static CONTROL: std::cell::OnceCell<Option<(PathBuf, PathBuf)>> = const { std::cell::OnceCell::new() };
+    static NEXT_TAB_SOCKET: Cell<u32> = const { Cell::new(0) };
+}
+
+fn attach_control() -> Option<(PathBuf, PathBuf)> {
+    CONTROL.with(|cell| {
+        cell.get_or_init(|| {
+            let started = attach_ipc::socket_dir().and_then(|dir| {
+                attach_ipc::remove_stale_sockets(&dir);
+                control::start(&dir, handle_control).map(|path| (dir, path))
+            });
+            match started {
+                Ok(paths) => Some(paths),
+                Err(err) => {
+                    eprintln!("term-flashy: attach disabled: {err}");
+                    attach_log(&format!("attach disabled: {err}"));
+                    None
+                }
+            }
+        })
+        .clone()
+    })
+}
+
+/// Appends to ~/.local/state/term-flashy/attach.log. Never logs tab contents.
+fn attach_log(line: &str) {
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| glib::home_dir().join(".local/state"));
+    let path = state_dir.join("term-flashy").join("attach.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = glib::DateTime::now_local()
+        .ok()
+        .and_then(|now| now.format("%F %T").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{stamp} {line}");
+    }
+}
+
+/// Window number (1-based) and tab id of the tab owning `socket`.
+fn find_attach_tab(socket: &Path) -> Option<(Rc<AppUi>, usize, u32)> {
+    WINDOWS.with(|windows| {
+        windows.borrow().iter().enumerate().find_map(|(index, weak)| {
+            let ui = weak.upgrade()?;
+            let id = ui
+                .tabs
+                .borrow()
+                .iter()
+                .find(|(_, tab)| tab.attach.as_ref().is_some_and(|a| a.socket == socket))
+                .map(|(id, _)| *id)?;
+            Some((ui, index + 1, id))
+        })
+    })
+}
+
+fn handle_control(request: control::Request) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match request {
+        control::Request::List => {
+            let windows: Vec<serde_json::Value> = WINDOWS.with(|windows| {
+                windows
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, weak)| {
+                        let ui = weak.upgrade()?;
+                        Some(json!({"window": index + 1, "tabs": ui.tab_list_json()}))
+                    })
+                    .collect()
+            });
+            Some(json!({"pid": std::process::id(), "windows": windows}))
+        }
+        control::Request::Action { command, peer_pid } => Some(handle_tab_action(&command, peer_pid)),
+        control::Request::HostHello {
+            socket,
+            peer_pid,
+            writer,
+        } => {
+            let refused = Some(json!({"ok": false}));
+            // Only pty-hosts we spawned ourselves may register.
+            if attach_ipc::parent_pid(peer_pid) != Some(std::process::id() as i32) {
+                return refused;
+            }
+            let (ui, _, id) = find_attach_tab(&socket)?;
+            let tabs = ui.tabs.borrow();
+            let tab = tabs.get(&id)?;
+            let attach = tab.attach.as_ref()?;
+            if attach.host.borrow().is_some() {
+                return refused;
+            }
+            let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+            *attach.host.borrow_mut() = Some(writer);
+            Some(json!({"ok": true, "blocked": tab.attach_blocked.get()}))
+        }
+        control::Request::HostEvent { socket, event } => {
+            let (ui, window, id) = find_attach_tab(&socket)?;
+            let tabs = ui.tabs.borrow();
+            let tab = tabs.get(&id)?;
+            let attach = tab.attach.as_ref()?;
+            let title = attach_ipc::sanitize(&tab.label.text(), 100);
+            let mut peer = format!("peer_pid={}", event["peer_pid"].as_i64().unwrap_or(0));
+            if let Some(cmd) = event["peer_cmd"].as_str() {
+                peer.push_str(&format!(" peer_cmd=\"{}\"", attach_ipc::sanitize(cmd, 200)));
+            }
+            match event["event"].as_str() {
+                Some(kind @ ("connect" | "disconnect")) => {
+                    let clients = event["clients"].as_u64().unwrap_or(0);
+                    attach.clients.set(clients);
+                    attach.indicator.set_visible(clients > 0);
+                    if kind == "connect" {
+                        // Being looked at over attach counts as seen.
+                        tab.row.remove_css_class("notify");
+                    }
+                    attach_log(&format!(
+                        "{kind} window={window} tab=\"{title}\" clients={clients} {peer}"
+                    ));
+                    drop(tabs);
+                    ui.schedule_session_save();
+                }
+                Some("reject") => {
+                    let reason = attach_ipc::sanitize(event["reason"].as_str().unwrap_or(""), 50);
+                    attach_log(&format!(
+                        "reject window={window} tab=\"{title}\" reason={reason} {peer}"
+                    ));
+                }
+                _ => {}
+            }
+            None
+        }
+        control::Request::HostGone { socket } => {
+            let (ui, _, id) = find_attach_tab(&socket)?;
+            if let Some(attach) = ui.tabs.borrow().get(&id).and_then(|t| t.attach.clone()) {
+                attach.clients.set(0);
+                attach.indicator.set_visible(false);
+                attach.host.borrow_mut().take();
+            }
+            None
+        }
+    }
+}
+
+/// `new` / `rename` / `close` from `attach`, only on tabs that accept attach.
+fn handle_tab_action(command: &serde_json::Value, peer_pid: i32) -> serde_json::Value {
+    use serde_json::json;
+    let fail = |error: &str| json!({"ok": false, "error": error});
+    let Some(socket) = command["socket"].as_str().map(PathBuf::from) else {
+        return fail("pedido inválido");
+    };
+    let Some((ui, window, id)) = find_attach_tab(&socket) else {
+        return fail("aba não encontrada ou sem attach");
+    };
+    let (title, blocked, cwd, index) = {
+        let tabs = ui.tabs.borrow();
+        let Some(tab) = tabs.get(&id) else {
+            return fail("aba não encontrada");
+        };
+        (
+            attach_ipc::sanitize(&tab.label.text(), 100),
+            tab.attach_blocked.get(),
+            terminal_cwd(&tab.terminal),
+            tab.row.index(),
+        )
+    };
+    if blocked {
+        return fail("esta aba está bloqueada para attach");
+    }
+    let peer = format!(
+        "peer_pid={peer_pid} peer_cmd=\"{}\"",
+        attach_ipc::process_cmdline(peer_pid)
+    );
+    match command["cmd"].as_str() {
+        Some("new") => match ui.add_tab(None, Some(FromAttach { index, cwd })) {
+            Some(new_socket) => {
+                attach_log(&format!("new window={window} after=\"{title}\" {peer}"));
+                json!({"ok": true, "socket": new_socket})
+            }
+            None => fail("não foi possível criar a aba com attach"),
+        },
+        Some("rename") => {
+            let new_title = attach_ipc::sanitize(command["title"].as_str().unwrap_or(""), 100);
+            let new_title = new_title.trim();
+            if new_title.is_empty() {
+                return fail("nome vazio");
+            }
+            if let Some(tab) = ui.tabs.borrow().get(&id) {
+                tab.label.set_text(new_title);
+            }
+            ui.schedule_session_save();
+            attach_log(&format!(
+                "rename window={window} tab=\"{title}\" to=\"{new_title}\" {peer}"
+            ));
+            json!({"ok": true})
+        }
+        Some("close") => {
+            ui.close_tab(id);
+            attach_log(&format!("close window={window} tab=\"{title}\" {peer}"));
+            json!({"ok": true})
+        }
+        _ => fail("comando desconhecido"),
+    }
 }
 
 struct AppUi {
@@ -275,7 +530,35 @@ fn scan_wallpaper_folder(folder: &str) -> Vec<std::path::PathBuf> {
 }
 
 impl AppUi {
+    /// Tabs in sidebar order, for the control socket's `list`.
+    fn tab_list_json(&self) -> Vec<serde_json::Value> {
+        let tabs = self.tabs.borrow();
+        let mut list = Vec::new();
+        let mut index = 0;
+        while let Some(row) = self.list_box.row_at_index(index) {
+            index += 1;
+            let Some(tab) = tabs.values().find(|tab| tab.row == row) else {
+                continue;
+            };
+            list.push(serde_json::json!({
+                "title": tab.label.text().as_str(),
+                "notify": row.has_css_class("notify"),
+                "socket": tab.attach.as_ref().map(|a| a.socket.clone()),
+                "blocked": tab.attach_blocked.get(),
+                "clients": tab.attach.as_ref().map_or(0, |a| a.clients.get()),
+            }));
+        }
+        list
+    }
+
     fn mark_tab_notify(self: &Rc<Self>, page_name: &str, row: &gtk4::ListBoxRow) {
+        // A tab someone is attached to counts as visible.
+        let attached = self.tabs.borrow().values().any(|tab| {
+            tab.row == *row && tab.attach.as_ref().is_some_and(|a| a.clients.get() > 0)
+        });
+        if attached {
+            return;
+        }
         if self.stack.visible_child_name().as_deref() != Some(page_name) {
             row.add_css_class("notify");
             self.schedule_session_save();
@@ -346,7 +629,12 @@ impl AppUi {
         }
     }
 
-    fn add_tab(self: &Rc<Self>, restore: Option<session::TabState>) {
+    /// Returns the new tab's attach socket, if it has one.
+    fn add_tab(
+        self: &Rc<Self>,
+        restore: Option<session::TabState>,
+        from_attach: Option<FromAttach>,
+    ) -> Option<PathBuf> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let page_name = format!("tab-{id}");
@@ -368,15 +656,41 @@ impl AppUi {
             &[],
         );
         terminal.set_scrollback_lines(self.config.borrow().scrollback_lines as _);
-        let restore_dir = restore.as_ref().and_then(|r| r.cwd.as_deref());
+        let restore_dir = restore
+            .as_ref()
+            .and_then(|r| r.cwd.as_deref())
+            .or(from_attach.as_ref().and_then(|f| f.cwd.as_deref()));
         let restore_title = restore.as_ref().map(|r| r.title.clone());
+        let attach_blocked = Rc::new(Cell::new(restore.as_ref().is_some_and(|r| r.attach_blocked)));
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let envv = shell_env(&shell);
         let envv_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
+        // With attach on, the shell runs under our own pty-host so other
+        // terminals can connect to it.
+        let attach_target = if self.config.borrow().attach_enabled || from_attach.is_some() {
+            attach_control()
+        } else {
+            None
+        }
+        .and_then(|(dir, control)| {
+            // Not current_exe(): after reinstalling while running, that path
+            // reads "… (deleted)" and can't be executed. /proc/self/exe in
+            // the forked child is still this exact binary.
+            let exe = "/proc/self/exe".to_string();
+            let n = NEXT_TAB_SOCKET.with(|next| next.replace(next.get() + 1));
+            let socket = dir.join(format!("tab-{}-{n}.sock", std::process::id()));
+            Some((exe, socket.to_str()?.to_string(), control.to_str()?.to_string()))
+        });
+        let argv: Vec<&str> = match &attach_target {
+            Some((exe, socket, control)) => {
+                vec![exe, "pty-host", "--socket", socket, "--control", control, "--", &shell]
+            }
+            None => vec![&shell],
+        };
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             restore_dir,
-            &[&shell],
+            &argv,
             &envv_refs,
             glib::SpawnFlags::DEFAULT,
             || {},
@@ -517,6 +831,18 @@ impl AppUi {
         close_button.set_has_frame(false);
         close_button.add_css_class("term-flashy-btn");
 
+        let attach_indicator = Label::new(Some("⇄"));
+        attach_indicator.set_tooltip_text(Some("Conectada via term-flashy attach"));
+        attach_indicator.set_visible(false);
+        let attach = attach_target.map(|(_, socket, _)| {
+            Rc::new(TabAttach {
+                socket: PathBuf::from(socket),
+                clients: Cell::new(0),
+                host: RefCell::new(None),
+                indicator: attach_indicator.clone(),
+            })
+        });
+
         let row_box = GtkBox::new(Orientation::Horizontal, 6);
         row_box.set_margin_start(8);
         row_box.set_margin_end(4);
@@ -524,14 +850,20 @@ impl AppUi {
         row_box.set_margin_bottom(4);
         row_box.append(&label);
         row_box.append(&entry);
+        row_box.append(&attach_indicator);
         row_box.append(&close_button);
 
         let row = gtk4::ListBoxRow::new();
         row.set_widget_name(&page_name);
         row.set_child(Some(&row_box));
 
-        self.list_box.append(&row);
-        self.list_box.select_row(Some(&row));
+        match &from_attach {
+            Some(from) => self.list_box.insert(&row, from.index + 1),
+            None => {
+                self.list_box.append(&row);
+                self.list_box.select_row(Some(&row));
+            }
+        }
 
         // Right-click a tab for a small context menu: rename (same action as
         // the double-click shortcut), and forcing the orange notify
@@ -545,6 +877,9 @@ impl AppUi {
         let window_for_menu = self.window.clone();
         let start_rename_for_menu = Rc::clone(&start_rename);
         let ui_for_menu = Rc::clone(self);
+        let attach_for_menu = attach.clone();
+        let attach_blocked_for_menu = Rc::clone(&attach_blocked);
+        let label_for_menu = label.clone();
         right_click_gesture.connect_pressed(move |gesture, _n_press, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
 
@@ -609,6 +944,34 @@ impl AppUi {
                 ui_for_pending.schedule_session_save();
             });
             menu_box.append(&pending_button);
+
+            if let Some(attach) = &attach_for_menu {
+                let blocked = Rc::clone(&attach_blocked_for_menu);
+                let block_label = if blocked.get() {
+                    "Desbloquear attach"
+                } else {
+                    "Bloquear attach"
+                };
+                let block_button = Button::with_label(block_label);
+                block_button.set_has_frame(false);
+                let popover_for_block = popover.clone();
+                let attach = Rc::clone(attach);
+                let ui_for_block = Rc::clone(&ui_for_menu);
+                let label_for_block = label_for_menu.clone();
+                block_button.connect_clicked(move |_| {
+                    popover_for_block.popdown();
+                    let on = !blocked.get();
+                    blocked.set(on);
+                    attach.send_block(on);
+                    attach_log(&format!(
+                        "{} tab=\"{}\"",
+                        if on { "block" } else { "unblock" },
+                        attach_ipc::sanitize(&label_for_block.text(), 100)
+                    ));
+                    ui_for_block.schedule_session_save();
+                });
+                menu_box.append(&block_button);
+            }
 
             popover.set_child(Some(&menu_box));
             popover.popup();
@@ -720,8 +1083,11 @@ impl AppUi {
             ui_for_cwd.schedule_session_save();
         });
 
-        self.stack.set_visible_child_name(&page_name);
-        terminal.grab_focus();
+        if from_attach.is_none() {
+            self.stack.set_visible_child_name(&page_name);
+            terminal.grab_focus();
+        }
+        let socket = attach.as_ref().map(|a| a.socket.clone());
         self.tabs.borrow_mut().insert(
             id,
             TabEntry {
@@ -732,9 +1098,12 @@ impl AppUi {
                 font_size,
                 row,
                 label,
+                attach,
+                attach_blocked,
             },
         );
         self.schedule_session_save();
+        socket
     }
 
     /// Debounces session writes: `current-directory-uri-changed` can fire in
@@ -770,16 +1139,13 @@ impl AppUi {
                 .strip_prefix("tab-")
                 .and_then(|s| s.parse().ok());
             if let Some(entry) = id.and_then(|id| tabs.get(&id)) {
-                let cwd = terminal_cwd_uri(&entry.terminal)
-                    .and_then(|uri| glib::filename_from_uri(&uri).ok())
-                    .map(|(path, _hostname)| path)
-                    .filter(|path| path.is_dir())
-                    .map(|path| path.to_string_lossy().into_owned());
+                let cwd = terminal_cwd(&entry.terminal);
                 saved_tabs.push(session::TabState {
                     title: entry.label.text().to_string(),
                     cwd,
                     notify: entry.row.has_css_class("notify"),
                     font_size: entry.font_size.get(),
+                    attach_blocked: entry.attach_blocked.get(),
                 });
             }
             index += 1;
@@ -1032,6 +1398,14 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
     });
     root.append(&scrollback_unlimited_check);
 
+    let attach_check =
+        gtk4::CheckButton::with_label("Allow term-flashy attach (e.g. over SSH) on new tabs");
+    attach_check.set_tooltip_text(Some(
+        "Any program running as your user can then type into those tabs.",
+    ));
+    attach_check.set_active(current.attach_enabled);
+    root.append(&attach_check);
+
     drop(current);
 
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -1073,6 +1447,7 @@ fn open_settings_window(ui: &Rc<AppUi>, parent: &ApplicationWindow) {
             } else {
                 scrollback_spin.value() as i64
             },
+            attach_enabled: attach_check.is_active(),
         };
         config::save(&new_config);
         *ui_for_save.config.borrow_mut() = new_config;
@@ -1169,6 +1544,7 @@ fn build_ui(app: &Application) {
         suppress_notify_clear: Cell::new(None),
     });
     ui.restart_wallpaper_rotation();
+    WINDOWS.with(|windows| windows.borrow_mut().push(Rc::downgrade(&ui)));
 
     // Flush the session synchronously on a clean shutdown: a pending
     // debounced timeout from schedule_session_save() won't get a chance to
@@ -1209,7 +1585,7 @@ fn build_ui(app: &Application) {
 
     let ui_for_add = Rc::clone(&ui);
     add_button.connect_clicked(move |_| {
-        ui_for_add.add_tab(None);
+        ui_for_add.add_tab(None, None);
     });
 
     let ui_for_settings = Rc::clone(&ui);
@@ -1258,7 +1634,7 @@ fn build_ui(app: &Application) {
         if state.contains(ctrl_shift) {
             match keyval {
                 gdk::Key::T | gdk::Key::t => {
-                    ui_for_shortcut.add_tab(None);
+                    ui_for_shortcut.add_tab(None, None);
                     return glib::Propagation::Stop;
                 }
                 gdk::Key::F | gdk::Key::f => {
@@ -1286,11 +1662,11 @@ fn build_ui(app: &Application) {
         session::SessionState::default()
     };
     if saved_session.tabs.is_empty() {
-        ui.add_tab(None);
+        ui.add_tab(None, None);
     } else {
         let pending: Vec<bool> = saved_session.tabs.iter().map(|tab| tab.notify).collect();
         for tab in saved_session.tabs {
-            ui.add_tab(Some(tab));
+            ui.add_tab(Some(tab), None);
         }
         let active_row = ui
             .list_box
@@ -1312,8 +1688,13 @@ fn build_ui(app: &Application) {
 const HELP_TEXT: &str = include_str!("../HELP.txt");
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    if args.any(|arg| arg == "--help" || arg == "-h") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("attach") => attach::run(),
+        Some("pty-host") => pty_host::run(&args[1..]),
+        _ => {}
+    }
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{HELP_TEXT}");
         return;
     }
@@ -1329,5 +1710,10 @@ fn main() {
         );
     });
     app.connect_activate(build_ui);
+    app.connect_shutdown(|_| {
+        if let Some(Some((_, control))) = CONTROL.with(|cell| cell.get().cloned()) {
+            let _ = std::fs::remove_file(control);
+        }
+    });
     app.run();
 }

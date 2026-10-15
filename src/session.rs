@@ -16,6 +16,9 @@ pub struct TabState {
     /// Font size set by this tab's own zoom; `None` = follows the default.
     #[serde(default)]
     pub font_size: Option<f64>,
+    /// Refuses `term-flashy attach` connections to this tab.
+    #[serde(default)]
+    pub attach_blocked: bool,
 }
 
 fn session_file_path() -> std::path::PathBuf {
